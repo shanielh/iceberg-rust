@@ -52,6 +52,7 @@ pub struct ParquetWriterBuilder {
     props: WriterProperties,
     schema: SchemaRef,
     match_mode: FieldMatchMode,
+    row_group_size_bytes: Option<usize>,
 }
 
 impl ParquetWriterBuilder {
@@ -71,7 +72,22 @@ impl ParquetWriterBuilder {
             props,
             schema,
             match_mode,
+            row_group_size_bytes: None,
         }
+    }
+
+    /// Target an on-disk **encoded (post-compression)** size for each row group.
+    ///
+    /// [`WriterProperties::max_row_group_size`] bounds a row group only by row
+    /// *count*, so the on-disk size of a group depends on how well the data
+    /// compresses. When this is set, the writer additionally cuts a row group as
+    /// soon as its anticipated encoded size (parquet's
+    /// [`AsyncArrowWriter::in_progress_size`]) reaches `bytes`, yielding
+    /// byte-uniform row groups without predicting a compression ratio. Checked
+    /// after each write; the row-count cap still applies as an upper bound.
+    pub fn with_row_group_size_bytes(mut self, bytes: usize) -> Self {
+        self.row_group_size_bytes = Some(bytes);
+        self
     }
 }
 
@@ -83,6 +99,7 @@ impl FileWriterBuilder for ParquetWriterBuilder {
             schema: self.schema.clone(),
             inner_writer: None,
             writer_properties: self.props.clone(),
+            row_group_size_bytes: self.row_group_size_bytes,
             current_row_num: 0,
             output_file,
             nan_value_count_visitor: NanValueCountVisitor::new_with_match_mode(self.match_mode),
@@ -214,6 +231,7 @@ pub struct ParquetWriter {
     output_file: OutputFile,
     inner_writer: Option<AsyncArrowWriter<AsyncFileWriter>>,
     writer_properties: WriterProperties,
+    row_group_size_bytes: Option<usize>,
     current_row_num: usize,
     nan_value_count_visitor: NanValueCountVisitor,
 }
@@ -512,6 +530,24 @@ impl FileWriter for ParquetWriter {
             )
             .with_source(err)
         })?;
+
+        // Cut a row group once its anticipated encoded size reaches the configured
+        // byte target. `in_progress_size` is parquet's estimate of the post-encoding
+        // (post-compression) size of the open row group, so this bounds row groups by
+        // on-disk bytes regardless of compression ratio. The row-count cap in
+        // `writer_properties` still applies — whichever fires first cuts the group.
+        if self
+            .row_group_size_bytes
+            .is_some_and(|target| writer.in_progress_size() >= target)
+        {
+            writer.flush().await.map_err(|err| {
+                Error::new(
+                    ErrorKind::Unexpected,
+                    "Failed to flush row group in parquet writer.",
+                )
+                .with_source(err)
+            })?;
+        }
 
         Ok(())
     }
